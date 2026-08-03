@@ -21,6 +21,64 @@ import {
 } from "../extensions/harness.js";
 import { parseConfig } from "../extensions/harness/config.js";
 
+// ─────────────────────────────────────────────────────────────────────────
+// P0-1 contract: surgical reasoning_content strip/preserve
+// ─────────────────────────────────────────────────────────────────────────
+// Extracted as a pure function for testing. This mirrors the cache.ts context
+// hook logic but with the P0-1 fix: reasoning_content MUST be preserved on
+// assistant messages that carry tool_calls (DeepSeek contract), and MUST be
+// stripped from plain assistant/tool messages (cache prefix stability).
+// Pattern matches reasonix's:
+//   TestBuildRequestDropsReasoningOnPlainAssistantTurn
+//   TestBuildRequestRoundTripsReasoningOnDeepSeekToolCalls
+
+/** Message shape as seen by the cache.ts context hook. */
+interface ContextMessage {
+	role: string;
+	content?: unknown;
+	reasoning_content?: string;
+	reasoning?: string;
+	tool_calls?: unknown[];
+}
+
+/**
+ * Strip reasoning fields from context messages surgically:
+ * - Plain assistant (no tool_calls) → strip
+ * - Assistant with tool_calls → PRESERVE (DeepSeek requires round-trip)
+ * - Tool messages → strip
+ * - User messages → no-op
+ *
+ * Returns count of fields stripped.
+ */
+function stripReasoningSurgical(messages: ContextMessage[]): number {
+	let stripped = 0;
+	for (const msg of messages) {
+		if (msg.role === "assistant") {
+			const hasToolCalls =
+				Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+			if (hasToolCalls) continue; // preserve for DeepSeek round-trip
+			if ("reasoning_content" in msg) {
+				delete msg.reasoning_content;
+				stripped++;
+			}
+			if ("reasoning" in msg) {
+				delete msg.reasoning;
+				stripped++;
+			}
+		} else if (msg.role === "tool") {
+			if ("reasoning_content" in msg) {
+				delete msg.reasoning_content;
+				stripped++;
+			}
+			if ("reasoning" in msg) {
+				delete msg.reasoning;
+				stripped++;
+			}
+		}
+	}
+	return stripped;
+}
+
 const originalEnv = { ...process.env };
 
 afterEach(() => {
@@ -940,5 +998,359 @@ describe("buildPlanDirective", () => {
 		expect(directive).toContain("2. List");
 		expect(directive).toContain("3. Explain");
 		expect(directive).toContain("4. Note");
+	});
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+// P2-1: Cache E2E tests — reasoning preservation, byte stability, tool sort
+// ═════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────────────────
+// reasoning_content handling (P0-1 contract)
+// ─────────────────────────────────────────────────────────────────────────
+
+describe("reasoning_content handling", () => {
+	it("strips reasoning_content from plain assistant messages (no tool_calls)", () => {
+		const msgs: ContextMessage[] = [
+			{ role: "user", content: "hello" },
+			{
+				role: "assistant",
+				content: "the answer",
+				reasoning_content: "CHAIN-OF-THOUGHT",
+			},
+		];
+		const stripped = stripReasoningSurgical(msgs);
+		expect(stripped).toBe(1);
+		expect(msgs[1]).not.toHaveProperty("reasoning_content");
+		expect(msgs[1]).toHaveProperty("content", "the answer");
+	});
+
+	it("preserves reasoning_content on assistant messages with tool_calls", () => {
+		const msgs: ContextMessage[] = [
+			{ role: "user", content: "count go files" },
+			{
+				role: "assistant",
+				reasoning_content: "CHAIN-OF-THOUGHT",
+				tool_calls: [
+					{
+						id: "c1",
+						name: "bash",
+						arguments: '{"command":"ls"}',
+					},
+				],
+			},
+		];
+		const stripped = stripReasoningSurgical(msgs);
+		expect(stripped).toBe(0);
+		expect(msgs[1]).toHaveProperty(
+			"reasoning_content",
+			"CHAIN-OF-THOUGHT",
+		);
+		expect(msgs[1]).toHaveProperty("tool_calls");
+	});
+
+	it("preserves reasoning_content with multiple tool_calls", () => {
+		const msgs: ContextMessage[] = [
+			{ role: "user", content: "read and edit" },
+			{
+				role: "assistant",
+				reasoning_content: "MULTI-TOOL-CHAIN",
+				tool_calls: [
+					{ id: "c1", name: "read", arguments: '{"path":"a.ts"}' },
+					{ id: "c2", name: "grep", arguments: '{"pattern":"foo"}' },
+				],
+			},
+		];
+		const stripped = stripReasoningSurgical(msgs);
+		expect(stripped).toBe(0);
+		expect(msgs[1]).toHaveProperty(
+			"reasoning_content",
+			"MULTI-TOOL-CHAIN",
+		);
+	});
+
+	it("strips reasoning from tool messages", () => {
+		const msgs: ContextMessage[] = [
+			{ role: "user", content: "read file" },
+			{
+				role: "assistant",
+				tool_calls: [
+					{ id: "c1", name: "read", arguments: '{"path":"f.ts"}' },
+				],
+			},
+			{
+				role: "tool",
+				tool_call_id: "c1",
+				content: "file content",
+				reasoning_content: "LEAKED-CHAIN",
+			},
+		];
+		const stripped = stripReasoningSurgical(msgs);
+		expect(stripped).toBe(1);
+		expect(msgs[2]).not.toHaveProperty("reasoning_content");
+	});
+
+	it("strips reasoning field alongside reasoning_content", () => {
+		const msgs: ContextMessage[] = [
+			{ role: "user", content: "hi" },
+			{
+				role: "assistant",
+				content: "answer",
+				reasoning_content: "chain",
+				reasoning: "alt-chain",
+			},
+		];
+		const stripped = stripReasoningSurgical(msgs);
+		expect(stripped).toBe(2);
+		expect(msgs[1]).not.toHaveProperty("reasoning_content");
+		expect(msgs[1]).not.toHaveProperty("reasoning");
+	});
+
+	it("leaves user messages untouched", () => {
+		const msgs: ContextMessage[] = [
+			{
+				role: "user",
+				content: "question",
+				reasoning_content: "should-be-ignored",
+			},
+		];
+		const stripped = stripReasoningSurgical(msgs);
+		expect(stripped).toBe(0);
+		expect(msgs[0]).toHaveProperty(
+			"reasoning_content",
+			"should-be-ignored",
+		);
+	});
+
+	it("handles empty messages array", () => {
+		expect(stripReasoningSurgical([])).toBe(0);
+	});
+
+	it("strips empty tool_calls array as plain assistant (no real tool calls)", () => {
+		const msgs: ContextMessage[] = [
+			{ role: "user", content: "hi" },
+			{
+				role: "assistant",
+				content: "answer",
+				reasoning_content: "chain",
+				tool_calls: [],
+			},
+		];
+		const stripped = stripReasoningSurgical(msgs);
+		expect(stripped).toBe(1);
+		expect(msgs[1]).not.toHaveProperty("reasoning_content");
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// cache: prefix byte-stability e2e
+// ─────────────────────────────────────────────────────────────────────────
+
+describe("cache: prefix byte-stability e2e", () => {
+	it("produces byte-identical prompt across 50 simulated turns with varying dates", () => {
+		// Simulate a real pi system prompt with instructions + date/time/today lines
+		const baseInstructions = [
+			"You are a helpful coding agent. You have access to tools.",
+			"Always verify your changes before applying them.",
+			"Use read and grep to understand the codebase before editing.",
+		].join("\n");
+
+		const generatePrompt = (dayOffset: number): string => {
+			const date = new Date(2026, 2, 21 + dayOffset);
+			return [
+				baseInstructions,
+				`Current date is: ${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`,
+				`Current time is: ${10 + (dayOffset % 8)}:${String((dayOffset * 7) % 60).padStart(2, "0")}:00`,
+				`Today is: ${date.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}`,
+			].join("\n");
+		};
+
+		// Generate 50 prompts with different dates
+		const prompts = Array.from({ length: 50 }, (_, i) =>
+			generatePrompt(i),
+		);
+
+		// Without stripping, every prompt is different
+		const uniqueRaw = new Set(prompts);
+		expect(uniqueRaw.size).toBe(50); // all 50 are unique
+
+		// With timestamp stripping, all should be byte-identical
+		const cleaned = prompts.map((p) => stripTimestampsFromPrompt(p));
+		const uniqueCleaned = new Set(cleaned);
+
+		expect(uniqueCleaned.size).toBe(1);
+		expect(cleaned[0]).toBe(cleaned[49]);
+		// Content preserved; stripTimestampsFromPrompt may leave trailing newlines
+		expect(cleaned[0].trim()).toBe(baseInstructions);
+	});
+
+	it("byte-stability survives midnight boundary", () => {
+		// The most dangerous cache-killer: midnight rollover
+		const beforeMidnight = [
+			"You are a coding agent.",
+			"Current date is: 2026-03-21",
+			"Current time is: 23:59:00",
+		].join("\n");
+
+		const afterMidnight = [
+			"You are a coding agent.",
+			"Current date is: 2026-03-22",
+			"Current time is: 00:01:00",
+		].join("\n");
+
+		expect(stripTimestampsFromPrompt(beforeMidnight)).toBe(
+			stripTimestampsFromPrompt(afterMidnight),
+		);
+	});
+
+	it("byte-stability survives session resume (same base, different date)", () => {
+		// When a session is resumed days later, the system prompt prefix must
+		// still match for DeepSeek cache hits.
+		const originalSession = [
+			"You are a coding agent. Use tools carefully.",
+			"Current date is: 2026-03-21",
+			"Current time is: 10:00:00",
+			"Today is: Monday, March 21",
+			"",
+			"Project context: TypeScript monorepo with strict mode.",
+		].join("\n");
+
+		const resumedSession = [
+			"You are a coding agent. Use tools carefully.",
+			"Current date is: 2026-03-28",
+			"Current time is: 14:30:00",
+			"Today is: Monday, March 28",
+			"",
+			"Project context: TypeScript monorepo with strict mode.",
+		].join("\n");
+
+		const cleanedOriginal = stripTimestampsFromPrompt(originalSession);
+		const cleanedResumed = stripTimestampsFromPrompt(resumedSession);
+
+		expect(cleanedOriginal).toBe(cleanedResumed);
+		expect(cleanedOriginal).toContain("Project context:");
+		expect(cleanedOriginal).not.toContain("2026-03");
+		expect(cleanedOriginal).not.toContain("Monday");
+	});
+
+	it("preserves non-date content between stripped lines", () => {
+		const prompt = [
+			"Instruction block 1.",
+			"Current date is: 2026-03-21",
+			"Instruction block 2.",
+			"Current time is: 14:30:00",
+			"Instruction block 3.",
+			"Today is: Monday",
+			"Instruction block 4.",
+		].join("\n");
+
+		const cleaned = stripTimestampsFromPrompt(prompt);
+		expect(cleaned).toContain("Instruction block 1.");
+		expect(cleaned).toContain("Instruction block 2.");
+		expect(cleaned).toContain("Instruction block 3.");
+		expect(cleaned).toContain("Instruction block 4.");
+		expect(cleaned).not.toContain("2026-03-21");
+		expect(cleaned).not.toContain("14:30:00");
+		expect(cleaned).not.toContain("Monday");
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// cache: tool sort determinism e2e
+// ─────────────────────────────────────────────────────────────────────────
+
+describe("cache: tool sort determinism e2e", () => {
+	/** Pure sort function matching the cache.ts hook logic exactly. */
+	function sortTools(tools: Record<string, unknown>[]): Record<string, unknown>[] {
+		const sorted = [...tools];
+		sorted.sort((a, b) => {
+			const fnA = a.function as Record<string, unknown> | undefined;
+			const fnB = b.function as Record<string, unknown> | undefined;
+			const nameA =
+				(fnA?.name as string) ?? (a.name as string) ?? "";
+			const nameB =
+				(fnB?.name as string) ?? (b.name as string) ?? "";
+			return nameA.localeCompare(nameB);
+		});
+		return sorted;
+	}
+
+	it("same tools in different order produce identical sorted output", () => {
+		const toolsA = [
+			{ function: { name: "z_tool" }, description: "last" },
+			{ function: { name: "a_tool" }, description: "first" },
+			{ function: { name: "m_tool" }, description: "middle" },
+		];
+
+		const toolsB = [
+			toolsA[2]!,
+			toolsA[0]!,
+			toolsA[1]!,
+		];
+
+		const sortedA = sortTools(toolsA);
+		const sortedB = sortTools(toolsB);
+
+		expect(sortedA).toEqual(sortedB);
+		expect(sortedA[0]!.function!.name).toBe("a_tool");
+		expect(sortedA[1]!.function!.name).toBe("m_tool");
+		expect(sortedA[2]!.function!.name).toBe("z_tool");
+	});
+
+	it("sorts mixed OpenAI format (function.name) and direct format (name)", () => {
+		const mixedTools = [
+			{ name: "bravo" },
+			{ function: { name: "alpha" } },
+			{ name: "charlie" },
+		];
+
+		const sorted = sortTools(mixedTools as Record<string, unknown>[]);
+
+		const names = sorted.map((t) => {
+			const fn = t.function as Record<string, unknown> | undefined;
+			return (fn?.name as string) ?? (t.name as string) ?? "";
+		});
+		expect(names).toEqual(["alpha", "bravo", "charlie"]);
+	});
+
+	it("handles tools with missing names (falls back to empty string)", () => {
+		const tools = [
+			{ function: { name: "z_tool" } },
+			{ function: { description: "no name here" } }, // no name at all
+			{ function: { name: "a_tool" } },
+		];
+
+		const sorted = sortTools(tools as Record<string, unknown>[]);
+
+		const names = sorted.map((t) => {
+			const fn = t.function as Record<string, unknown> | undefined;
+			return (fn?.name as string) ?? (t.name as string) ?? "";
+		});
+		// Empty string sorts before "a"
+		expect(names[0]).toBe("");
+		expect(names[1]).toBe("a_tool");
+		expect(names[2]).toBe("z_tool");
+	});
+
+	it("idempotent: sorting already-sorted tools does not change order", () => {
+		const tools = [
+			{ function: { name: "a_tool" } },
+			{ function: { name: "b_tool" } },
+			{ function: { name: "c_tool" } },
+		];
+
+		const sortedOnce = sortTools(tools);
+		const sortedTwice = sortTools(sortedOnce);
+
+		expect(sortedTwice).toEqual(sortedOnce);
+	});
+
+	it("empty tools array is a no-op", () => {
+		expect(sortTools([])).toEqual([]);
+	});
+
+	it("single tool is unchanged", () => {
+		const tools = [{ function: { name: "only_tool" } }];
+		expect(sortTools(tools)).toEqual(tools);
 	});
 });

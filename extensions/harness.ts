@@ -125,7 +125,7 @@ export default function harnessPlugin(pi: ExtensionAPI): void {
 			// Module status
 			lines.push("Modules:");
 			lines.push(
-				`  cache         ${config.cache.enabled ? "ON" : "OFF"}  — reasoning stripped: ${cacheStats.reasoningStripped}, tools sorted: ${cacheStats.toolsSorted}, timestamps stripped: ${cacheStats.timestampsStripped}`,
+				`  cache         ${config.cache.enabled ? "ON" : "OFF"}  — reasoning stripped: ${cacheStats.reasoningStripped}, preserved (tool calls): ${cacheStats.reasoningPreserved}, tools sorted: ${cacheStats.toolsSorted}, timestamps stripped: ${cacheStats.timestampsStripped}`,
 			);
 			lines.push(
 				`  stormbreaker  ${config.stormbreaker.enabled ? "ON" : "OFF"}  — errors enhanced: ${stormbreakerState.errorsEnhanced}, loops broken: ${stormbreakerState.loopsBroken} (threshold: ${config.stormbreaker.threshold})`,

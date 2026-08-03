@@ -37,6 +37,8 @@ export interface HarnessConfig {
 		enabled: boolean;
 		/** Number of consecutive identical failures before breaking the loop. */
 		threshold: number;
+		/** Escalation strategy: "guard_then_abort" (inject guard into tool result first, abort on next failure) or "abort" (current behavior). */
+		escalation: "guard_then_abort" | "abort";
 	};
 	planmode: {
 		enabled: boolean;
@@ -76,6 +78,8 @@ export interface FailureRecord {
 	count: number;
 	/** Last toolCallId that failed. */
 	lastToolCallId: string;
+	/** Whether a guard message has been injected into the tool result (tier 1 escalation). */
+	guarded: boolean;
 }
 
 /** A single hash-anchored edit in an edit_lines call. */

@@ -25,6 +25,8 @@ import { matchesModelPattern } from "./utils.js";
 export interface CacheStats {
 	/** Number of context events where reasoning_content was stripped. */
 	reasoningStripped: number;
+	/** Number of assistant messages with tool_calls where reasoning was preserved. */
+	reasoningPreserved: number;
 	/** Number of request payloads where tools were sorted. */
 	toolsSorted: number;
 	/** Number of system prompts where timestamps were stripped. */
@@ -51,6 +53,7 @@ export function registerCacheHooks(
 ): CacheStats {
 	const stats: CacheStats = {
 		reasoningStripped: 0,
+		reasoningPreserved: 0,
 		toolsSorted: 0,
 		timestampsStripped: 0,
 		contextEvents: 0,
@@ -65,9 +68,15 @@ export function registerCacheHooks(
 	// array. We walk assistant messages and delete reasoning_content fields.
 	// This both protects the cache prefix and prevents context bloat from
 	// accumulated thinking tokens.
+	//
+	// IMPORTANT: DeepSeek requires reasoning_content to round-trip on
+	// tool-call turns (assistant messages with tool_calls). A missing
+	// reasoning_content on such a turn causes a 400 error. We preserve
+	// reasoning on those messages and only strip from plain assistant
+	// turns (no tool_calls) and tool messages.
 	if (config.stripReasoning) {
 		pi.on("context", async (event, ctx: ExtensionContext) => {
-			if (!matchesModelPattern(ctx.model, patterns)) return;
+			if (ctx.model && !matchesModelPattern(ctx.model, patterns)) return;
 			stats.contextEvents++;
 			let stripped = 0;
 			for (const msg of event.messages) {
@@ -76,6 +85,16 @@ export function registerCacheHooks(
 				const anyMsg = msg as unknown as Record<string, unknown>;
 				const role = anyMsg.role;
 				if (role === "assistant" || role === "tool") {
+					// DeepSeek requires reasoning_content to round-trip on
+					// tool-call turns. Skip stripping on assistant messages
+					// that carry non-empty tool_calls.
+					if (role === "assistant") {
+						const tc = anyMsg.tool_calls;
+						if (Array.isArray(tc) && tc.length > 0) {
+							stats.reasoningPreserved++;
+							continue;
+						}
+					}
 					if ("reasoning_content" in anyMsg) {
 						delete anyMsg.reasoning_content;
 						stripped++;
@@ -142,7 +161,7 @@ export function registerCacheHooks(
 	// byte-stable across turns.
 	if (config.stripTimestamps) {
 		pi.on("before_agent_start", async (event, ctx: ExtensionContext) => {
-			if (!matchesModelPattern(ctx.model, patterns)) return;
+			if (ctx.model && !matchesModelPattern(ctx.model, patterns)) return;
 			const prompt = event.systemPrompt;
 			if (!TIMESTAMP_RE.test(prompt)) return;
 

@@ -273,6 +273,28 @@ export function registerRewind(
 
 			state.totalRewinds++;
 
+			// ── Step 3: Cache staleness warning ────────────────────────────
+			// Rewind restores files to an earlier state, but the DeepSeek
+			// prompt-cache prefix (which includes the full conversation
+			// history) still reflects the post-rewind message sequence.
+			// Subsequent LLM calls may serve stale cached completions that
+			// assume the conversation is longer than it now is.
+			//
+			// reasonix equivalent: TestSaveSnapshotRejectsStalePrefixOverwrite
+			// rejects snapshots with fewer messages than current session.
+			ctx.ui.notify(
+				[
+					"⚠️  Cache prefix may be stale after rewind.",
+					"The DeepSeek prompt cache still reflects the pre-rewind",
+					"conversation length. This can cause stale cached",
+					"completions on subsequent turns.",
+					"",
+					"Recommend: run /reload to start a fresh session with",
+					"a clean cache prefix, or watch for unexpected output.",
+				].join("\n"),
+				"warning",
+			);
+
 			ctx.ui.notify(
 				[
 					`Rewound to before turn ${targetTurn}.`,
