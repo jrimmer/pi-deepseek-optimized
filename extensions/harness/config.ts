@@ -41,6 +41,13 @@ function envList(name: string, fallback: string[]): string[] {
 		.filter(Boolean);
 }
 
+/** Parse an escalation strategy env var, returning fallback when unset/invalid. */
+function envEscalation(name: string, fallback: "guard_then_abort" | "abort"): "guard_then_abort" | "abort" {
+	const value = process.env[name]?.trim().toLowerCase();
+	if (value === "abort" || value === "guard_then_abort") return value;
+	return fallback;
+}
+
 /**
  * Build the full HarnessConfig from environment variables.
  *
@@ -54,6 +61,7 @@ function envList(name: string, fallback: string[]): string[] {
  *   _HASHLINES_ENABLED    hashline editing       (default: true)
  *   _STORMBREAKER_ENABLED storm-breaker          (default: true)
  *   _STORMBREAKER_THRESHOLD consecutive failures (default: 3)
+ *   _STORMBREAKER_ESCALATION "guard_then_abort" (inject guard first) or "abort" (default: guard_then_abort)
  *   _PLANMODE_ENABLED     plan mode              (default: true)
  *   _PLANMODE_SHORTCUT    toggle shortcut        (default: ctrl+shift+p)
  *   _PLANMODE_READONLY_TOOLS  read-only tools    (default: read,grep,find,ls)
@@ -76,6 +84,7 @@ export function parseConfig(): HarnessConfig {
 		stormbreaker: {
 			enabled: envBool("PI_HARNESS_STORMBREAKER_ENABLED", true),
 			threshold: envInt("PI_HARNESS_STORMBREAKER_THRESHOLD", 3),
+			escalation: envEscalation("PI_HARNESS_STORMBREAKER_ESCALATION", "guard_then_abort"),
 		},
 		planmode: {
 			enabled: envBool("PI_HARNESS_PLANMODE_ENABLED", true),
