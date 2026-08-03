@@ -76,7 +76,7 @@ export function registerCacheHooks(
 	// turns (no tool_calls) and tool messages.
 	if (config.stripReasoning) {
 		pi.on("context", async (event, ctx: ExtensionContext) => {
-			if (!matchesModelPattern(ctx.model, patterns)) return;
+			if (ctx.model && !matchesModelPattern(ctx.model, patterns)) return;
 			stats.contextEvents++;
 			let stripped = 0;
 			for (const msg of event.messages) {
@@ -161,7 +161,7 @@ export function registerCacheHooks(
 	// byte-stable across turns.
 	if (config.stripTimestamps) {
 		pi.on("before_agent_start", async (event, ctx: ExtensionContext) => {
-			if (!matchesModelPattern(ctx.model, patterns)) return;
+			if (ctx.model && !matchesModelPattern(ctx.model, patterns)) return;
 			const prompt = event.systemPrompt;
 			if (!TIMESTAMP_RE.test(prompt)) return;
 
