@@ -7,6 +7,7 @@ import {
 	enhanceError,
 	errorSignature,
 	extractErrorText,
+	tailOf,
 	matchesModelPattern,
 	TIMESTAMP_RE,
 	stripTimestampsFromPrompt,
@@ -174,14 +175,58 @@ describe("extractErrorText", () => {
 		expect(extractErrorText(content)).toBe("Error");
 	});
 
-	it("caps at 500 characters", () => {
+	// ⚠️ THIS TEST USED TO PIN THE BUG. It asserted `extractErrorText` caps at 500,
+	// which is what destroyed every failing test run: pytest's verdict is at the END,
+	// so a 500-character HEAD slice delivered progress dots and nothing else.
+	it("does NOT truncate long output", () => {
 		const longText = "x".repeat(600);
 		const content = [{ type: "text", text: longText }];
-		expect(extractErrorText(content).length).toBe(500);
+		expect(extractErrorText(content).length).toBe(600);
+		expect(extractErrorText(content)).toBe(longText);
+	});
+
+	it("keeps a pytest verdict that appears after the progress dots", () => {
+		// Shape of a real `hack.py itest-gate` result: ~900 bytes of dots, verdict last.
+		const dots = ".................. [ 12%]\n".repeat(30);
+		const output =
+			dots +
+			"FAILED tests/integration/test_import_upload.py::test_upload_accepts_csv\n" +
+			"1 failed, 554 passed in 38.41s\n";
+		const extracted = extractErrorText([{ type: "text", text: output }]);
+		expect(extracted).toContain("1 failed, 554 passed");
+		expect(extracted).toContain("test_upload_accepts_csv");
+		expect(extracted.length).toBe(output.length);
 	});
 
 	it("handles empty content", () => {
 		expect(extractErrorText([])).toBe("");
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// tailOf
+// ─────────────────────────────────────────────────────────────────────────
+
+describe("tailOf", () => {
+	it("returns short text untouched", () => {
+		expect(tailOf("short", 100)).toBe("short");
+	});
+
+	it("is a no-op at exactly the limit", () => {
+		const exact = "x".repeat(100);
+		expect(tailOf(exact, 100)).toBe(exact);
+	});
+
+	it("keeps the END and marks the elision", () => {
+		const text = "A".repeat(900) + "VERDICT";
+		const result = tailOf(text, 100);
+		expect(result.endsWith("VERDICT")).toBe(true);
+		expect(result.startsWith("…")).toBe(true);
+		expect(result.length).toBe(101); // ellipsis + 100 chars
+	});
+
+	it("never reads past the end for a zero budget", () => {
+		expect(tailOf("anything", 0)).toBe("");
 	});
 });
 
@@ -211,6 +256,25 @@ describe("errorSignature", () => {
 		const sig1 = errorSignature("read", "permission denied");
 		const sig2 = errorSignature("read", "file not found");
 		expect(sig1).not.toBe(sig2);
+	});
+
+	// ⚠️ RED BEFORE THIS FIX, AND IT ABORTED WORKING AGENTS. Both runs below are
+	// typical failing pytest results with IDENTICAL leading progress dots. Because the
+	// signature was taken from the head, both hashed to the same key; three such
+	// "identical" failures reach the threshold and the storm-breaker calls
+	// ctx.abort(), killing an agent mid-investigation.
+	it("distinguishes failures that share a long identical prefix", () => {
+		const dots = ".................. [ 12%]\n".repeat(30);
+		const runA =
+			dots + "FAILED tests/test_a.py::test_one - AssertionError: alpha\n1 failed, 9 passed";
+		const runB =
+			dots + "FAILED tests/test_b.py::test_two - AssertionError: beta\n2 failed, 8 passed";
+		expect(errorSignature("bash", runA)).not.toBe(errorSignature("bash", runB));
+	});
+
+	it("still collapses a genuinely repeated failure", () => {
+		const run = "FAILED tests/test_a.py::test_one - AssertionError: alpha\n1 failed, 9 passed";
+		expect(errorSignature("bash", run)).toBe(errorSignature("bash", run));
 	});
 });
 
@@ -246,10 +310,30 @@ describe("enhanceError", () => {
 		expect(result).toContain("shorter than expected");
 	});
 
-	it("passes through unrecognised errors with tool name prefix", () => {
-		const result = enhanceError("bash", "command not found: weirdcmd");
-		expect(result).toContain("[bash]");
-		expect(result).toContain("command not found: weirdcmd");
+	// ⚠️ THIS TEST USED TO PIN THE BUG. The default branch returned
+	// `[${toolName}] ${errorText}`, which ALWAYS differed from the input — so the
+	// caller's `enhanced === errorText` stand-down never fired and EVERY failing
+	// command had its result replaced. Returning the input unchanged is what makes
+	// that check meaningful.
+	it("returns unrecognised errors UNCHANGED, so the caller can stand down", () => {
+		const original = "command not found: weirdcmd";
+		const result = enhanceError("bash", original);
+		expect(result).toBe(original);
+	});
+
+	it("appends guidance instead of replacing the error text", () => {
+		// The caller substitutes this for the WHOLE tool result, so anything dropped
+		// here is deleted from what the model sees.
+		for (const [input, needle] of [
+			["open : no such file or directory", "empty or missing"],
+			["permission denied", "not readable"],
+			["old_text did not match anything in the file", "re-read"],
+			["offset 500 is beyond end of file (100 lines total)", "shorter than expected"],
+		] as const) {
+			const result = enhanceError("read", input);
+			expect(result.startsWith(input)).toBe(true);
+			expect(result).toContain(needle);
+		}
 	});
 });
 

@@ -106,8 +106,23 @@ export function annotateContent(content: string, startLine = 1): string {
 /**
  * Extract the error message from a tool result's content array.
  *
- * Tool results contain `(TextContent | ImageContent)[]`. We concatenate
- * all text content to produce an error signature for storm-breaker dedup.
+ * Tool results contain `(TextContent | ImageContent)[]`. We concatenate all text
+ * content so callers can see the failure as the tool reported it.
+ *
+ * ⚠️ THIS MUST NOT TRUNCATE. It used to end in `.slice(0, 500)`, and that single
+ * line destroyed every failing test run an agent made.
+ *
+ * The measurement, 2026-10-23: `hack.py itest-gate` streams ~900 bytes of pytest
+ * progress and puts the verdict LAST. A head-slice to 500 kept 30 lines of dots
+ * and discarded "1 failed, 554 passed", so the model received a result of exactly
+ * 507 characters — `"[bash] "` + 500 — and concluded the run had been cut off
+ * while the operator watched it finish. That length occurred 58 times in one
+ * worktree. Successful results in the same sessions were 600+ characters and
+ * arrived intact, so the cap was ours and it applied only to the error path:
+ * precisely the path where the agent must read what happened to correct course.
+ *
+ * Bounding is not this function's job. The bash tool already truncates its own
+ * result to 2000 lines / 50KB and names a spill file for the remainder.
  */
 export function extractErrorText(
 	content: { type: string; text?: string; data?: string }[],
@@ -115,8 +130,25 @@ export function extractErrorText(
 	return content
 		.filter((c) => c.type === "text" && c.text)
 		.map((c) => c.text!)
-		.join("\n")
-		.slice(0, 500); // cap for dedup signature
+		.join("\n");
+}
+
+/**
+ * The LAST `maxChars` characters, marked as elided when anything was dropped.
+ *
+ * ⚠️ THE TAIL IS THE ONLY END WORTH KEEPING. Every tool an agent runs puts its
+ * conclusion last: pytest's summary, a traceback's final exception, a compiler's
+ * error count, the shell's exit status. A head-slice keeps the preamble and throws
+ * the answer away.
+ *
+ * The leading ellipsis is load-bearing. A silently shortened string is
+ * indistinguishable from a complete one, and a fragment that looks authoritative
+ * is worse than a short message.
+ */
+export function tailOf(text: string, maxChars: number): string {
+	if (maxChars <= 0) return "";
+	if (text.length <= maxChars) return text;
+	return `…${text.slice(-maxChars)}`;
 }
 
 /**
@@ -127,20 +159,48 @@ export function extractErrorText(
  * are considered the same failure class.
  */
 export function errorSignature(toolName: string, errorText: string): string {
-	const normalized = errorText
+	// ⚠️ THE SIGNATURE IS DERIVED FROM THE TAIL, AND IT USED TO BE DERIVED FROM THE HEAD.
+	//
+	// Measured 2026-10-23: two runs of DIFFERENT failing tests produced the SAME
+	// signature, because both inputs were the first 500 bytes of pytest progress dots:
+	//
+	//   run A: "bash:.................. [ 12%]\n.................. [ 12%]\n..."
+	//   run B: "bash:.................. [ 12%]\n.................. [ 12%]\n..."   <- identical
+	//
+	// Three such "identical" failures reach the storm-breaker threshold and it calls
+	// ctx.abort(), killing a working agent mid-investigation. The abort is not a false
+	// positive on the TOOL; it is a false positive on the SIGNATURE, so fixing what the
+	// signature reads fixes the abort. The tail is where failures actually differ.
+	const normalized = tailOf(errorText, 4000)
 		.replace(/\/[^\s:]+/g, "<path>") // file paths
 		.replace(/line \d+/gi, "line N") // line numbers
 		.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/g, "<timestamp>") // ISO timestamps
-		.replace(/\b0x[0-9a-f]+\b/gi, "<hex>") // hex addresses
-		.slice(0, 200);
-	return `${toolName}:${normalized}`;
+		.replace(/\b0x[0-9a-f]+\b/gi, "<hex>"); // hex addresses
+	// Cap the KEY, not the reading of it: a dedup key only has to be stable and
+	// distinctive, and after normalization the distinction lives in the tail.
+	return `${toolName}:${tailOf(normalized, 500)}`;
 }
 
 /**
  * Enhance a raw tool error message to be more actionable.
  *
- * Catches common unhelpful error patterns and replaces them with messages
- * that tell the model *what to fix*, not just *what broke*.
+ * Catches common unhelpful error patterns and APPENDS guidance that tells the model
+ * *what to fix*, not just *what broke*.
+ *
+ * ⚠️ THE TWO CONTRACTS THIS FUNCTION MUST HOLD, AND USED TO BREAK.
+ *
+ * 1. APPEND, NEVER REPLACE. The caller substitutes this return value for the WHOLE
+ *    tool result (`content: [{ type: "text", text: enhanced }]`), so anything not
+ *    contained in the returned string is DELETED from what the model sees. Two
+ *    branches used to return guidance alone and threw the tool's own words away.
+ *
+ * 2. RETURN THE INPUT UNCHANGED WHEN THERE IS NO GUIDANCE TO ADD. The caller's
+ *    `enhanced === errorText` check is what keeps the hook from rewriting results
+ *    that need no help. The default branch used to return `[${toolName}] ${errorText}`,
+ *    which ALWAYS differed, so that check never fired and every failing command had
+ *    its output replaced. That is the mechanism by which a failing test run lost
+ *    pytest's verdict. The tool name is already on the result (`toolName` on the
+ *    toolResult message), so prefixing it here bought nothing and cost the output.
  */
 export function enhanceError(toolName: string, errorText: string): string {
 	// Empty path errors
@@ -149,7 +209,7 @@ export function enhanceError(toolName: string, errorText: string): string {
 		/no such file or directory/i.test(errorText)
 	) {
 		if (/open\s+:|open\s+''/.test(errorText) || errorText.includes('""')) {
-			return `Error: the 'path' argument is empty or missing. Please provide a valid file path.`;
+			return `${errorText}\n\nError: the 'path' argument is empty or missing. Please provide a valid file path.`;
 		}
 	}
 
@@ -173,8 +233,10 @@ export function enhanceError(toolName: string, errorText: string): string {
 		return `${errorText}\nThe file may be shorter than expected. Use read without offset to see the full file.`;
 	}
 
-	// Default: pass through with tool name context
-	return `[${toolName}] ${errorText}`;
+	// Default: no guidance applies. Return the input UNCHANGED so the caller's
+	// `enhanced === errorText` check short-circuits and the tool result is left
+	// exactly as the tool produced it. See contract (2) in the docstring.
+	return errorText;
 }
 
 /**

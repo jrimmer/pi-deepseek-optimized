@@ -57,6 +57,7 @@ export {
 	enhanceError,
 	errorSignature,
 	extractErrorText,
+	tailOf,
 	matchesModelPattern,
 } from "./harness/utils.js";
 export { parseConfig } from "./harness/config.js";
